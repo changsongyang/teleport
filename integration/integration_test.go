@@ -892,9 +892,13 @@ func (s *IntSuite) TestShutdown(c *check.C) {
 }
 
 type disconnectTestCase struct {
-	recordingMode     string
-	options           services.RoleOptions
-	disconnectTimeout time.Duration
+	recordingMode      string
+	options            services.RoleOptions
+	disconnectTimeout  time.Duration
+	concurrentSessions int
+	sessCtlTimeout     time.Duration
+	assertExpected     func(*check.C, error)
+	postFunc           func(context.Context, *check.C, *TeleInstance)
 }
 
 // TestDisconnectScenarios tests multiple scenarios with client disconnects
@@ -935,6 +939,64 @@ func (s *IntSuite) TestDisconnectScenarios(c *check.C) {
 			},
 			disconnectTimeout: 4 * time.Second,
 		},
+		{ // verify that concurrent session limits are applied when recording at node
+			recordingMode: services.RecordAtNode,
+			options: services.RoleOptions{
+				MaxConcurrentSessions: 1,
+			},
+			disconnectTimeout:  1 * time.Second,
+			concurrentSessions: 2,
+			assertExpected: func(c *check.C, err error) {
+				if err == nil || !strings.Contains(err.Error(), "administratively prohibited") {
+					c.Fatalf("Expected 'administratively prohibited', got: %v", err)
+				}
+			},
+		},
+		{ // verify that concurrent session limits are applied when recording at proxy
+			recordingMode: services.RecordAtProxy,
+			options: services.RoleOptions{
+				ForwardAgent:          services.NewBool(true),
+				MaxConcurrentSessions: 1,
+			},
+			disconnectTimeout:  1 * time.Second,
+			concurrentSessions: 2,
+			assertExpected: func(c *check.C, err error) {
+				if err == nil || !strings.Contains(err.Error(), "administratively prohibited") {
+					c.Fatalf("Expected 'administratively prohibited', got: %v", err)
+				}
+			},
+		},
+		{ // verify that lost connections to auth server terminate controlled sessions
+			recordingMode: services.RecordAtNode,
+			options: services.RoleOptions{
+				MaxConcurrentSessions: 1,
+			},
+			disconnectTimeout: time.Second,
+			sessCtlTimeout:    500 * time.Millisecond,
+			// use postFunc to wait for the semaphore to be acquired, and then shut down the
+			// auth server.
+			postFunc: func(ctx context.Context, c *check.C, t *TeleInstance) {
+				site := t.GetSiteAPI(Site)
+				var sems []services.Semaphore
+				var err error
+				for i := 0; i < 6; i++ {
+					sems, err = site.GetSemaphores(ctx, services.SemaphoreFilter{
+						SemaphoreKind: services.SemaphoreKindSessionControl,
+					})
+					if err == nil && len(sems) > 0 {
+						break
+					}
+					select {
+					case <-time.After(time.Millisecond * 100):
+					case <-ctx.Done():
+						return
+					}
+				}
+				c.Assert(err, check.IsNil)
+				c.Assert(len(sems), check.Equals, 1)
+				c.Assert(t.StopAuth(false), check.IsNil)
+			},
+		},
 	}
 	for _, tc := range testCases {
 		s.runDisconnectTest(c, tc)
@@ -962,8 +1024,9 @@ func (s *IntSuite) runDisconnectTest(c *check.C, tc disconnectTestCase) {
 	t.AddUserWithRole(username, role)
 
 	clusterConfig, err := services.NewClusterConfig(services.ClusterConfigSpecV3{
-		SessionRecording: tc.recordingMode,
-		LocalAuth:        services.NewBool(true),
+		SessionRecording:      tc.recordingMode,
+		LocalAuth:             services.NewBool(true),
+		SessionControlTimeout: services.Duration(tc.sessCtlTimeout),
 	})
 	c.Assert(err, check.IsNil)
 
@@ -983,35 +1046,59 @@ func (s *IntSuite) runDisconnectTest(c *check.C, tc disconnectTestCase) {
 	site := t.GetSiteAPI(Site)
 	c.Assert(site, check.NotNil)
 
-	person := NewTerminal(250)
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
 
-	// PersonA: SSH into the server, wait one second, then type some commands on stdin:
-	sessionCtx, sessionCancel := context.WithCancel(context.TODO())
-	openSession := func() {
-		defer sessionCancel()
-		cl, err := t.NewClient(ClientConfig{Login: username, Cluster: Site, Host: Host, Port: t.GetPortSSHInt()})
-		c.Assert(err, check.IsNil)
-		cl.Stdout = person
-		cl.Stdin = person
-
-		err = cl.SSH(context.TODO(), []string{}, false)
-		if err != nil && err != io.EOF {
-			c.Fatalf("expected EOF or nil, got %v instead", err)
-		}
+	if tc.concurrentSessions < 1 {
+		// test cases that don't specify concurrentSessions are single-session tests.
+		tc.concurrentSessions = 1
 	}
 
-	go openSession()
+	for i := 0; i < tc.concurrentSessions; i++ {
+		person := NewTerminal(250)
 
-	enterInput(c, person, "echo start \r\n", ".*start.*")
+		openSession := func() {
+			defer cancel()
+			cl, err := t.NewClient(ClientConfig{Login: username, Cluster: Site, Host: Host, Port: t.GetPortSSHInt()})
+			c.Assert(err, check.IsNil)
+			cl.Stdout = person
+			cl.Stdin = person
+
+			err = cl.SSH(ctx, []string{}, false)
+			select {
+			case <-ctx.Done():
+				// either we timed out, or a different session
+				// triggered closure.
+				return
+			default:
+			}
+			if tc.assertExpected != nil {
+				tc.assertExpected(c, err)
+			} else if err != nil && !trace.IsEOF(io.EOF) {
+				c.Fatalf("expected EOF or nil, got %v instead", err)
+			}
+		}
+
+		go openSession()
+
+		go enterInput(ctx, c, person, "echo start \r\n", ".*start.*")
+	}
+
+	if tc.postFunc != nil {
+		// test case modifies the teleport instance after session start
+		tc.postFunc(ctx, c, t)
+	}
+
 	select {
-	case <-time.After(tc.disconnectTimeout):
-		c.Fatalf("timeout waiting for session to exit")
-	case <-sessionCtx.Done():
-		// session closed
+	case <-time.After(tc.disconnectTimeout + time.Second):
+		c.Fatalf("timeout waiting for session to exit: %+v", tc)
+	case <-ctx.Done():
+		// session closed.  a test case is successful if the first
+		// session to close encountered the expected error variant.
 	}
 }
 
-func enterInput(c *check.C, person *Terminal, command, pattern string) {
+func enterInput(ctx context.Context, c *check.C, person *Terminal, command, pattern string) {
 	person.Type(command)
 	abortTime := time.Now().Add(10 * time.Second)
 	var matched bool
@@ -1020,15 +1107,16 @@ func enterInput(c *check.C, person *Terminal, command, pattern string) {
 		output = replaceNewlines(person.Output(1000))
 		matched, _ = regexp.MatchString(pattern, output)
 		if matched {
-			break
+			return
 		}
-		time.Sleep(time.Millisecond * 200)
+		select {
+		case <-time.After(time.Millisecond * 200):
+		case <-ctx.Done():
+			return
+		}
 		if time.Now().After(abortTime) {
 			c.Fatalf("failed to capture pattern %q in %q", pattern, output)
 		}
-	}
-	if !matched {
-		c.Fatalf("output %q does not match pattern %q", output, pattern)
 	}
 }
 
