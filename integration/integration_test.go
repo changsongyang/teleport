@@ -1074,7 +1074,7 @@ func (s *IntSuite) runDisconnectTest(c *check.C, tc disconnectTestCase) {
 			}
 			if tc.assertExpected != nil {
 				tc.assertExpected(c, err)
-			} else if err != nil && !trace.IsEOF(io.EOF) {
+			} else if err != nil && !trace.IsEOF(err) {
 				c.Fatalf("expected EOF or nil, got %v instead", err)
 			}
 		}
